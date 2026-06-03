@@ -2,26 +2,10 @@ import { Header } from "@/components/layout/Header";
 import { Button } from "@/components/ui/button";
 import { Badge } from "@/components/ui/badge";
 import { JOB_STATUS_LABELS, JOB_STATUS_COLORS } from "@/lib/constants";
+import { formatMoney, formatDate } from "@/lib/format";
 import { listJobs } from "./actions";
 import Link from "next/link";
 import { Plus } from "lucide-react";
-
-function formatMoney(value: string | null) {
-  if (value == null) return "—";
-  return new Intl.NumberFormat("en-AU", {
-    style: "currency",
-    currency: "AUD",
-  }).format(Number(value));
-}
-
-function formatDate(value: Date | null) {
-  if (!value) return "—";
-  return new Intl.DateTimeFormat("en-AU", {
-    day: "2-digit",
-    month: "short",
-    year: "numeric",
-  }).format(value);
-}
 
 export default async function JobsPage() {
   const jobs = await listJobs();
