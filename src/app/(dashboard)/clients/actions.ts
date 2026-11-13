@@ -1,70 +1,62 @@
 "use server";
 
 import { z } from "zod";
-import { asc, eq } from "drizzle-orm";
+import { and, eq } from "drizzle-orm";
 import { revalidatePath } from "next/cache";
 import { redirect } from "next/navigation";
 import { db } from "@/db";
 import { clients } from "@/db/schema";
 import { requireOrg } from "@/lib/auth";
+import { checkbox, formObject, invalid, optionalText, requiredText, type FormState } from "@/lib/actions";
 
-const emptyToUndefined = (v: unknown) => (v === "" ? undefined : v);
-
-const createClientSchema = z.object({
-  name: z.string().trim().min(1, "Name is required"),
-  address: z.preprocess(emptyToUndefined, z.string().trim().optional()),
-  phone: z.preprocess(emptyToUndefined, z.string().trim().optional()),
-  email: z.preprocess(emptyToUndefined, z.email("Invalid email").optional()),
-  notes: z.preprocess(emptyToUndefined, z.string().trim().optional()),
+const clientSchema = z.object({
+  name: requiredText("Client name is required"),
+  email: z.preprocess((v) => (v === "" ? undefined : v), z.string().trim().email("Enter a valid email").optional()),
+  phone: optionalText,
+  address: optionalText,
+  notes: optionalText,
+  isPreferred: checkbox,
 });
 
-export type CreateClientState = {
-  errors?: Record<string, string[]>;
-  message?: string;
-};
-
-/** Lists every client for the current org, alphabetically. */
-export async function listClients() {
+export async function saveClient(_prev: FormState, formData: FormData): Promise<FormState> {
   const { orgId } = await requireOrg();
-  return db.query.clients.findMany({
-    where: eq(clients.orgId, orgId),
-    orderBy: asc(clients.name),
-  });
-}
+  const id = formData.get("id");
+  const parsed = clientSchema.safeParse(formObject(formData));
+  if (!parsed.success) return invalid(parsed.error);
+  const d = parsed.data;
+  const values = {
+    name: d.name,
+    email: d.email ?? null,
+    phone: d.phone ?? null,
+    address: d.address ?? null,
+    notes: d.notes ?? null,
+    isPreferred: d.isPreferred,
+    updatedAt: new Date(),
+  };
 
-/**
- * Creates a client from the new-client form. Returns `{ errors }` for
- * `useActionState` on validation failure; on success revalidates and redirects.
- */
-export async function createClient(
-  _prevState: CreateClientState,
-  formData: FormData
-): Promise<CreateClientState> {
-  const { orgId } = await requireOrg();
-
-  const parsed = createClientSchema.safeParse({
-    name: formData.get("name"),
-    address: formData.get("address"),
-    phone: formData.get("phone"),
-    email: formData.get("email"),
-    notes: formData.get("notes"),
-  });
-
-  if (!parsed.success) {
-    return { errors: z.flattenError(parsed.error).fieldErrors };
+  let clientId: string;
+  if (typeof id === "string" && id) {
+    const [row] = await db
+      .update(clients)
+      .set(values)
+      .where(and(eq(clients.id, id), eq(clients.orgId, orgId)))
+      .returning({ id: clients.id });
+    if (!row) return { ok: false, message: "Client not found" };
+    clientId = row.id;
+  } else {
+    const [row] = await db.insert(clients).values({ ...values, orgId }).returning({ id: clients.id });
+    clientId = row.id;
   }
 
-  const data = parsed.data;
+  revalidatePath("/clients");
+  const returnTo = formData.get("returnTo");
+  redirect(typeof returnTo === "string" && returnTo.startsWith("/") ? returnTo : `/clients/${clientId}`);
+}
 
-  await db.insert(clients).values({
-    orgId,
-    name: data.name,
-    address: data.address ?? null,
-    phone: data.phone ?? null,
-    email: data.email ?? null,
-    notes: data.notes ?? null,
-  });
-
+export async function deleteClient(formData: FormData) {
+  const { orgId } = await requireOrg();
+  const id = String(formData.get("id") ?? "");
+  await db.delete(clients).where(and(eq(clients.id, id), eq(clients.orgId, orgId)));
   revalidatePath("/clients");
   redirect("/clients");
 }

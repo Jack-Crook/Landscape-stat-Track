@@ -1,24 +1,25 @@
-import { Header } from "@/components/layout/Header";
-import { asc, eq } from "drizzle-orm";
-import { db } from "@/db";
-import { clients } from "@/db/schema";
-import { requireOrg } from "@/lib/auth";
-import { NewJobForm } from "./new-job-form";
+import { getOrg } from "@/lib/auth";
+import { clientOptions, jobCategoryOptions } from "@/lib/data/lookups";
+import { toDateInput } from "@/lib/periods";
+import { Page, PageHeader } from "@/components/kit/ui";
+import { JobForm } from "../job-form";
 
-export default async function NewJobPage() {
-  const { orgId } = await requireOrg();
-  const clientOptions = await db.query.clients.findMany({
-    where: eq(clients.orgId, orgId),
-    orderBy: asc(clients.name),
-    columns: { id: true, name: true },
-  });
+export const metadata = { title: "New job" };
 
+export default async function NewJobPage({ searchParams }: { searchParams: Promise<{ clientId?: string }> }) {
+  const org = await getOrg();
+  const { clientId } = await searchParams;
+  const [clients, categories] = await Promise.all([clientOptions(org.id), jobCategoryOptions(org.id)]);
+  const client = clients.find((c) => c.id === clientId);
   return (
-    <div>
-      <Header title="New Job" />
-      <div className="p-6 max-w-2xl">
-        <NewJobForm clients={clientOptions} />
-      </div>
-    </div>
+    <Page>
+      <PageHeader title="New job" back={{ href: "/jobs", label: "Jobs" }} />
+      <JobForm
+        job={{ clientId: client?.id, siteAddress: client?.address, startDate: toDateInput(new Date()) }}
+        clients={clients}
+        categories={categories}
+        gstRegistered={org.gstRegistered}
+      />
+    </Page>
   );
 }

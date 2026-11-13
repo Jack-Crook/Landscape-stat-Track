@@ -1,13 +1,14 @@
-import { Header } from "@/components/layout/Header";
-import { NewClientForm } from "./new-client-form";
+import { Page, PageHeader } from "@/components/kit/ui";
+import { ClientForm } from "../client-form";
 
-export default function NewClientPage() {
+export const metadata = { title: "New client" };
+
+export default async function NewClientPage({ searchParams }: { searchParams: Promise<{ returnTo?: string }> }) {
+  const { returnTo } = await searchParams;
   return (
-    <div>
-      <Header title="New Client" />
-      <div className="p-6 max-w-xl">
-        <NewClientForm />
-      </div>
-    </div>
+    <Page>
+      <PageHeader title="New client" back={{ href: returnTo ?? "/clients", label: "Back" }} />
+      <ClientForm returnTo={returnTo} />
+    </Page>
   );
 }

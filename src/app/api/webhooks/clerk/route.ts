@@ -2,15 +2,17 @@ import { verifyWebhook } from "@clerk/nextjs/webhooks";
 import type { NextRequest } from "next/server";
 import { eq } from "drizzle-orm";
 import { db } from "@/db";
-import { organisations, users } from "@/db/schema";
+import { users } from "@/db/schema";
+import { provisionUser } from "@/lib/provision";
 
 /**
  * Clerk webhook endpoint. Provisions an organisation + owner user when a Clerk
  * account is created, and removes the user row when the account is deleted.
+ * (Users are also provisioned lazily on first request — see src/lib/auth.ts —
+ * so this webhook is an optimisation, not a requirement.)
  *
- * This route is unauthenticated (Clerk signs the request) and is whitelisted in
- * src/proxy.ts. `verifyWebhook` validates the Svix signature against
- * CLERK_WEBHOOK_SIGNING_SECRET and throws on failure.
+ * Unauthenticated (Clerk signs the request) and whitelisted in src/proxy.ts.
+ * `verifyWebhook` validates the Svix signature against CLERK_WEBHOOK_SIGNING_SECRET.
  */
 export async function POST(req: NextRequest) {
   let evt;
@@ -23,40 +25,18 @@ export async function POST(req: NextRequest) {
 
   if (evt.type === "user.created") {
     const data = evt.data;
-
-    // Idempotency: Clerk retries deliveries, so bail if this user already exists.
-    const existing = await db.query.users.findFirst({
-      where: eq(users.clerkId, data.id),
-    });
-    if (existing) {
-      return new Response("Already provisioned", { status: 200 });
-    }
-
-    const primaryEmail =
-      data.email_addresses.find((e) => e.id === data.primary_email_address_id)
-        ?.email_address ??
+    const email =
+      data.email_addresses.find((e) => e.id === data.primary_email_address_id)?.email_address ??
       data.email_addresses[0]?.email_address ??
       "";
-    const fullName =
-      [data.first_name, data.last_name].filter(Boolean).join(" ").trim() ||
-      primaryEmail ||
-      "New User";
-    const orgName = data.first_name ? `${data.first_name}'s Business` : "My Business";
+    const name = [data.first_name, data.last_name].filter(Boolean).join(" ").trim() || email || "New User";
 
-    // neon-http has no interactive transactions; db.batch() runs both inserts
-    // atomically. Pre-generate the org id so the user insert can reference it.
-    const orgId = crypto.randomUUID();
-    await db.batch([
-      db.insert(organisations).values({ id: orgId, name: orgName }),
-      db.insert(users).values({
-        orgId,
-        clerkId: data.id,
-        name: fullName,
-        email: primaryEmail,
-        role: "owner",
-      }),
-    ]);
-
+    await provisionUser({
+      clerkId: data.id,
+      name,
+      email,
+      orgName: data.first_name ? `${data.first_name}'s Business` : "My Business",
+    });
     return new Response("Provisioned", { status: 201 });
   }
 

@@ -1,282 +1,399 @@
-import { Header } from "@/components/layout/Header";
-import { Card, CardContent, CardHeader, CardTitle } from "@/components/ui/card";
-import { Input } from "@/components/ui/input";
-import { Label } from "@/components/ui/label";
-import { Button } from "@/components/ui/button";
-import { Badge } from "@/components/ui/badge";
-import {
-  JOB_STATUS_LABELS,
-  JOB_STATUS_COLORS,
-  COST_TYPE_LABELS,
-  DEFAULT_MILEAGE_RATE,
-} from "@/lib/constants";
-import { formatMoney, formatDate } from "@/lib/format";
-import {
-  getJob,
-  updateJobStatus,
-  addCostLine,
-  deleteCostLine,
-  addMileage,
-  deleteMileage,
-} from "../actions";
-import { notFound } from "next/navigation";
+import { and, desc, eq, isNull } from "drizzle-orm";
 import Link from "next/link";
-import { ArrowLeft, Trash2 } from "lucide-react";
+import { notFound } from "next/navigation";
+import { Camera, Check, MapPin, Repeat, Trash2 } from "lucide-react";
+import { db } from "@/db";
+import { receipts } from "@/db/schema";
+import { getOrg } from "@/lib/auth";
+import { getJobDetail } from "@/lib/data/jobs";
+import { clientOptions, jobCategoryOptions } from "@/lib/data/lookups";
+import { jobFinancials } from "@/lib/finance";
+import { toCents } from "@/lib/money";
+import { toDateInput } from "@/lib/periods";
+import {
+  COST_TYPE_LABELS,
+  INVOICE_STATUS_LABELS,
+  INVOICE_STATUS_TONES,
+  JOB_STATUS_LABELS,
+  JOB_STATUS_TONES,
+  JOB_STATUSES,
+  RECURRENCE_LABELS,
+} from "@/lib/constants";
+import { formatCents, formatDate, formatPercent, formatQuantity } from "@/lib/format";
+import { cn } from "@/lib/utils";
+import { KeyValue, LinkButton, Money, Page, PageHeader, Pill, Row, Section } from "@/components/kit/ui";
+import { ConfirmSubmit, SubmitButton } from "@/components/kit/client";
+import { SegmentedBar } from "@/components/charts/charts";
+import { JobForm } from "../job-form";
+import { deleteCostLine, deleteJob, deleteMileage, linkReceipt, unlinkReceipt, updateJobStatus } from "../actions";
+import { CostLineForm, HoursForm, MileageForm } from "./forms";
+import { JobPhotos } from "./photos";
 
-const STATUS_PIPELINE = ["quoted", "in_progress", "completed", "invoiced", "paid"] as const;
-const COST_TYPES = ["materials", "labour", "travel", "other"] as const;
-
-export default async function JobDetailPage({
+export default async function JobPage({
   params,
+  searchParams,
 }: {
   params: Promise<{ id: string }>;
+  searchParams: Promise<{ edit?: string }>;
 }) {
+  const org = await getOrg();
   const { id } = await params;
-  const job = await getJob(id);
+  const { edit } = await searchParams;
+  const job = await getJobDetail(org.id, id);
   if (!job) notFound();
 
+  if (edit) {
+    const [clients, categories] = await Promise.all([clientOptions(org.id), jobCategoryOptions(org.id)]);
+    return (
+      <Page>
+        <PageHeader title="Edit job" back={{ href: `/jobs/${id}`, label: job.name }} />
+        <JobForm
+          job={{
+            ...job,
+            startDate: toDateInput(job.startDate),
+            endDate: toDateInput(job.endDate),
+          }}
+          clients={clients}
+          categories={categories}
+          gstRegistered={org.gstRegistered}
+        />
+        <form action={deleteJob} className="mt-8 flex justify-center">
+          <input type="hidden" name="id" value={job.id} />
+          <ConfirmSubmit confirmText="Tap again to delete job">Delete job</ConfirmSubmit>
+        </form>
+        <p className="footnote mt-2 text-center text-label-2">Deletes its costs and mileage. Receipts and invoices are kept.</p>
+      </Page>
+    );
+  }
+
+  const unlinked = await db
+    .select({ id: receipts.id, vendor: receipts.vendor, date: receipts.date, total: receipts.total })
+    .from(receipts)
+    .where(and(eq(receipts.orgId, org.id), isNull(receipts.jobId), eq(receipts.status, "confirmed")))
+    .orderBy(desc(receipts.date))
+    .limit(50);
+
+  const f = jobFinancials({
+    quotedPrice: job.quotedPrice,
+    invoices: job.invoices,
+    costLines: job.costLines,
+    mileage: job.mileageLogs,
+    receipts: job.receipts,
+    gstRegistered: org.gstRegistered,
+    hoursWorked: job.hoursWorked,
+    estimatedCost: job.estimatedCost,
+  });
+  const statusIndex = JOB_STATUSES.indexOf(job.status);
+  const pendingReceipts = job.receipts.filter((r) => r.status === "needs_review");
+
   return (
-    <div>
-      <Header
+    <Page>
+      <PageHeader
         title={job.name}
-        action={
-          <Button variant="outline" size="sm" render={<Link href="/jobs" />}>
-            <ArrowLeft className="h-4 w-4 mr-1" />
-            Back
-          </Button>
+        back={{ href: "/jobs", label: "Jobs" }}
+        subtitle={
+          <span className="flex flex-wrap items-center gap-2">
+            <Pill tone={JOB_STATUS_TONES[job.status]}>{JOB_STATUS_LABELS[job.status]}</Pill>
+            {job.client && (
+              <Link href={`/clients/${job.client.id}`} className="font-medium text-tint-ink">
+                {job.client.name}
+              </Link>
+            )}
+            {job.category && <span>{job.category}</span>}
+            {job.isRecurring && (
+              <span className="inline-flex items-center gap-1">
+                <Repeat className="h-3.5 w-3.5" /> {RECURRENCE_LABELS[job.recurrenceInterval ?? ""] ?? "Repeats"}
+              </span>
+            )}
+          </span>
+        }
+        actions={
+          <>
+            <LinkButton href={`/jobs/${id}?edit=1`} variant="gray">
+              Edit
+            </LinkButton>
+            <LinkButton href={`/invoices/new?jobId=${id}`} variant="tinted">
+              Invoice
+            </LinkButton>
+          </>
         }
       />
-      <div className="p-6 space-y-6 max-w-4xl">
-        {/* Status pipeline */}
-        <Card>
-          <CardHeader>
-            <CardTitle className="text-sm font-medium">Status</CardTitle>
-          </CardHeader>
-          <CardContent>
-            <div className="flex flex-wrap gap-2">
-              {STATUS_PIPELINE.map((status) => {
-                const isCurrent = job.status === status;
-                return (
-                  <form
-                    key={status}
-                    action={async () => {
-                      "use server";
-                      await updateJobStatus(job.id, status);
-                    }}
+
+      {/* Status pipeline */}
+      <Section title="Progress">
+        <ol className="grid grid-cols-5 gap-1.5" aria-label="Job status">
+          {JOB_STATUSES.map((s, i) => {
+            const done = i < statusIndex;
+            const current = i === statusIndex;
+            return (
+              <li key={s}>
+                <form action={updateJobStatus}>
+                  <input type="hidden" name="jobId" value={job.id} />
+                  <input type="hidden" name="status" value={s} />
+                  <button
+                    type="submit"
+                    disabled={current}
+                    aria-current={current ? "step" : undefined}
+                    className={cn(
+                      "pressable flex w-full flex-col items-center gap-1.5 rounded-xl px-1 py-2.5 text-center text-[12px] font-semibold leading-tight transition-colors sm:text-[13px]",
+                      current && "on-tint bg-tint text-white",
+                      done && "bg-tint-soft text-tint-ink",
+                      !current && !done && "bg-fill text-label-2 hover:bg-fill-2"
+                    )}
                   >
-                    <Button
-                      type="submit"
-                      size="sm"
-                      variant={isCurrent ? "default" : "outline"}
-                      disabled={isCurrent}
+                    <span
+                      className={cn(
+                        "flex h-5 w-5 items-center justify-center rounded-full text-[11px]",
+                        current ? "bg-white/25" : done ? "bg-tint text-white on-tint" : "bg-surface"
+                      )}
+                      aria-hidden
                     >
-                      {JOB_STATUS_LABELS[status]}
-                    </Button>
-                  </form>
-                );
-              })}
+                      {done ? <Check className="h-3 w-3" strokeWidth={3} /> : i + 1}
+                    </span>
+                    {JOB_STATUS_LABELS[s]}
+                  </button>
+                </form>
+              </li>
+            );
+          })}
+        </ol>
+        <p className="footnote mt-3 text-label-2">
+          {job.status === "completed"
+            ? "Next: tap Invoiced to raise an invoice from this job."
+            : job.status === "invoiced"
+              ? "Tap Paid when the money lands. It's counted as income on that date."
+              : job.status === "paid"
+                ? "All done."
+                : "Tap a step to move the job along."}
+        </p>
+      </Section>
+
+      {/* Profit */}
+      <Section title="Profit">
+        {!f.hasPrice ? (
+          <p className="text-label-2">
+            Add a price to see profit.{" "}
+            <Link href={`/jobs/${id}?edit=1`} className="font-medium text-tint-ink">
+              Set price
+            </Link>
+          </p>
+        ) : (
+          <>
+            <div className="flex flex-wrap items-end justify-between gap-4">
+              <div>
+                <div className="footnote text-label-2">Profit{org.gstRegistered ? " (ex GST)" : ""}</div>
+                <div className={cn("hero-figure", f.profit < 0 && "text-bad")}>
+                  <Money cents={f.profit} />
+                </div>
+              </div>
+              <div className="grid grid-cols-3 gap-6 text-right">
+                <KeyValue label="Margin" value={formatPercent(f.margin)} tone={f.margin != null && f.margin < 15 ? "bad" : undefined} />
+                <KeyValue label="Per hour" value={f.profitPerHour == null ? "—" : formatCents(f.profitPerHour)} />
+                <KeyValue label="Hours" value={job.hoursWorked ? formatQuantity(job.hoursWorked) : "—"} />
+              </div>
             </div>
-          </CardContent>
-        </Card>
 
-        {/* Summary */}
-        <Card>
-          <CardHeader className="flex flex-row items-center justify-between">
-            <CardTitle className="text-sm font-medium">Summary</CardTitle>
-            <Badge className={JOB_STATUS_COLORS[job.status]}>
-              {JOB_STATUS_LABELS[job.status]}
-            </Badge>
-          </CardHeader>
-          <CardContent className="grid grid-cols-2 sm:grid-cols-3 gap-4 text-sm">
-            <Field label="Client" value={job.client?.name ?? "—"} />
-            <Field label="Category" value={job.category ?? "—"} />
-            <Field label="Quoted" value={formatMoney(job.quotedPrice)} />
-            <Field label="Actual cost" value={formatMoney(job.actualCost)} />
-            <Field
-              label="Profit"
-              value={formatMoney(job.profit)}
-              valueClass={
-                job.profit != null
-                  ? Number(job.profit) >= 0
-                    ? "text-green-700"
-                    : "text-red-700"
-                  : undefined
+            <dl className="mt-5 grid grid-cols-2 gap-4 border-t border-separator pt-4 sm:grid-cols-4">
+              <KeyValue label={org.gstRegistered ? "Price (incl. GST)" : "Price"} value={formatCents(f.priceInc)} />
+              {org.gstRegistered && <KeyValue label="GST to pay" value={formatCents(f.priceInc - f.revenue)} />}
+              <KeyValue label="Revenue" value={formatCents(f.revenue)} />
+              <KeyValue label="Costs" value={formatCents(f.costs.total)} />
+            </dl>
+
+            {f.costs.total > 0 && (
+              <div className="mt-5">
+                <SegmentedBar
+                  caption="Where the money went"
+                  parts={[
+                    { key: "profit", name: "Profit", value: Math.max(0, f.profit), color: "var(--series-3)" },
+                    { key: "materials", name: "Materials", value: f.costs.materials, color: "var(--series-2)" },
+                    { key: "receipts", name: "Receipts", value: f.costs.receipts, color: "var(--series-1)" },
+                    { key: "labour", name: "Labour", value: f.costs.labour, color: "var(--series-7)" },
+                    { key: "travel", name: "Travel & mileage", value: f.costs.travel + f.costs.mileage, color: "var(--series-4)" },
+                    { key: "other", name: "Other", value: f.costs.other, color: "var(--series-5)" },
+                  ]}
+                />
+              </div>
+            )}
+
+            {f.costVariance != null && (
+              <p className={cn("footnote mt-4 font-medium", f.costVariance > 0 ? "text-bad" : "text-good")}>
+                {f.costVariance > 0
+                  ? `${formatCents(f.costVariance)} over your expected costs of ${formatCents(toCents(job.estimatedCost))}.`
+                  : `${formatCents(-f.costVariance)} under your expected costs of ${formatCents(toCents(job.estimatedCost))}.`}
+              </p>
+            )}
+          </>
+        )}
+        <div className="mt-4 border-t border-separator pt-4">
+          <HoursForm jobId={job.id} />
+        </div>
+      </Section>
+
+      {/* Costs */}
+      <Section title="Costs" footer="Log what you pay others. Don't log your own time as labour; record hours worked instead.">
+        {job.costLines.length > 0 && (
+          <ul className="-mt-1 mb-4 divide-y divide-separator">
+            {job.costLines.map((c) => (
+              <li key={c.id} className="flex items-center gap-3 py-2.5">
+                <Pill tone="gray">{COST_TYPE_LABELS[c.type]}</Pill>
+                <span className="min-w-0 flex-1 truncate">{c.description || "—"}</span>
+                <span className="num text-right">
+                  {formatCents(toCents(c.amount))}
+                  {toCents(c.gstAmount) > 0 && <span className="footnote block text-label-3">incl. {formatCents(toCents(c.gstAmount))} GST</span>}
+                </span>
+                <form action={deleteCostLine}>
+                  <input type="hidden" name="jobId" value={job.id} />
+                  <input type="hidden" name="id" value={c.id} />
+                  <ConfirmSubmit variant="plain" confirmText="Delete" ariaLabel={`Delete ${c.description ?? "cost"}`}>
+                    <Trash2 className="h-4 w-4" />
+                  </ConfirmSubmit>
+                </form>
+              </li>
+            ))}
+          </ul>
+        )}
+        <CostLineForm jobId={job.id} gstRegistered={org.gstRegistered} />
+      </Section>
+
+      {/* Receipts */}
+      <Section
+        title="Receipts"
+        action={
+          <Link href={`/receipts/scan?jobId=${job.id}`} className="inline-flex items-center gap-1">
+            <Camera className="h-4 w-4" /> Scan for this job
+          </Link>
+        }
+        flush
+      >
+        {job.receipts.length === 0 ? (
+          <p className="p-4 text-label-2">No receipts linked. Scan one, or link one you&apos;ve already saved.</p>
+        ) : (
+          job.receipts.map((r) => (
+            <Row
+              key={r.id}
+              href={`/receipts/${r.id}`}
+              title={r.vendor}
+              subtitle={formatDate(r.date)}
+              detail={formatCents(toCents(r.total))}
+              trailing={
+                r.status === "needs_review" ? (
+                  <Pill tone="orange">Review</Pill>
+                ) : (
+                  <form action={unlinkReceipt}>
+                    <input type="hidden" name="jobId" value={job.id} />
+                    <input type="hidden" name="receiptId" value={r.id} />
+                    <SubmitButton variant="plain" size="sm">
+                      Unlink
+                    </SubmitButton>
+                  </form>
+                )
               }
+              chevron={false}
             />
-            <Field label="Start" value={formatDate(job.startDate)} />
-            <Field label="End" value={formatDate(job.endDate)} />
-          </CardContent>
-          {job.description && (
-            <CardContent className="pt-0 text-sm text-gray-600">
-              {job.description}
-            </CardContent>
-          )}
-        </Card>
+          ))
+        )}
+        {unlinked.length > 0 && (
+          <form action={linkReceipt} className="flex items-end gap-2 border-t border-separator p-4">
+            <input type="hidden" name="jobId" value={job.id} />
+            <label className="min-w-0 flex-1">
+              <span className="footnote mb-1.5 block px-1 font-medium text-label-2">Link a saved receipt</span>
+              <select name="receiptId" className="field" defaultValue="">
+                <option value="" disabled>
+                  Choose a receipt…
+                </option>
+                {unlinked.map((r) => (
+                  <option key={r.id} value={r.id}>
+                    {r.vendor} · {formatDate(r.date)} · {formatCents(toCents(r.total))}
+                  </option>
+                ))}
+              </select>
+            </label>
+            <SubmitButton variant="gray">Link</SubmitButton>
+          </form>
+        )}
+        {pendingReceipts.length > 0 && (
+          <p className="footnote border-t border-separator px-4 py-3 text-warn">
+            {pendingReceipts.length} receipt{pendingReceipts.length === 1 ? " needs" : "s need"} review before it counts toward costs.
+          </p>
+        )}
+      </Section>
 
-        {/* Cost lines */}
-        <Card>
-          <CardHeader>
-            <CardTitle className="text-sm font-medium">Cost Breakdown</CardTitle>
-          </CardHeader>
-          <CardContent className="space-y-4">
-            {job.costLines.length > 0 ? (
-              <table className="w-full text-sm">
-                <thead className="text-left text-gray-500 border-b">
-                  <tr>
-                    <th className="py-2 font-medium">Type</th>
-                    <th className="py-2 font-medium">Description</th>
-                    <th className="py-2 font-medium text-right">GST</th>
-                    <th className="py-2 font-medium text-right">Amount</th>
-                    <th className="py-2 w-8"></th>
-                  </tr>
-                </thead>
-                <tbody className="divide-y">
-                  {job.costLines.map((line) => (
-                    <tr key={line.id}>
-                      <td className="py-2">{COST_TYPE_LABELS[line.type]}</td>
-                      <td className="py-2 text-gray-600">{line.description ?? "—"}</td>
-                      <td className="py-2 text-right text-gray-500">{formatMoney(line.gstAmount)}</td>
-                      <td className="py-2 text-right">{formatMoney(line.amount)}</td>
-                      <td className="py-2 text-right">
-                        <form
-                          action={async () => {
-                            "use server";
-                            await deleteCostLine(job.id, line.id);
-                          }}
-                        >
-                          <button type="submit" className="text-gray-400 hover:text-red-600" aria-label="Delete cost line">
-                            <Trash2 className="h-4 w-4" />
-                          </button>
-                        </form>
-                      </td>
-                    </tr>
-                  ))}
-                </tbody>
-              </table>
-            ) : (
-              <p className="text-sm text-gray-400">No cost lines yet.</p>
-            )}
+      {/* Mileage */}
+      <Section title="Mileage">
+        {job.mileageLogs.length > 0 && (
+          <ul className="-mt-1 mb-4 divide-y divide-separator">
+            {job.mileageLogs.map((m) => (
+              <li key={m.id} className="flex items-center gap-3 py-2.5">
+                <span className="num w-20 shrink-0 font-medium">{formatQuantity(m.km)} km</span>
+                <span className="min-w-0 flex-1 truncate text-label-2">{m.notes || formatDate(m.createdAt)}</span>
+                <span className="num">{formatCents(toCents(m.total))}</span>
+                <form action={deleteMileage}>
+                  <input type="hidden" name="jobId" value={job.id} />
+                  <input type="hidden" name="id" value={m.id} />
+                  <ConfirmSubmit variant="plain" confirmText="Delete" ariaLabel="Delete trip">
+                    <Trash2 className="h-4 w-4" />
+                  </ConfirmSubmit>
+                </form>
+              </li>
+            ))}
+          </ul>
+        )}
+        <MileageForm jobId={job.id} rate={Number(org.mileageRate)} />
+      </Section>
 
-            <form
-              action={async (formData: FormData) => {
-                "use server";
-                await addCostLine(job.id, formData);
-              }}
-              className="grid grid-cols-1 sm:grid-cols-[140px_1fr_120px_auto] gap-2 items-end border-t pt-4"
-            >
-              <div className="space-y-1">
-                <Label htmlFor="type">Type</Label>
-                <select
-                  id="type"
-                  name="type"
-                  defaultValue="materials"
-                  className="flex h-9 w-full rounded-md border border-input bg-background px-3 py-1 text-sm"
-                >
-                  {COST_TYPES.map((t) => (
-                    <option key={t} value={t}>
-                      {COST_TYPE_LABELS[t]}
-                    </option>
-                  ))}
-                </select>
-              </div>
-              <div className="space-y-1">
-                <Label htmlFor="description">Description</Label>
-                <Input id="description" name="description" placeholder="e.g. 5x bags mulch" />
-              </div>
-              <div className="space-y-1">
-                <Label htmlFor="amount">Amount ($)</Label>
-                <Input id="amount" name="amount" type="number" step="0.01" min="0" required placeholder="0.00" />
-              </div>
-              <Button type="submit" size="sm">Add</Button>
-              <label className="sm:col-span-4 flex items-center gap-2 text-xs text-gray-500">
-                <input type="checkbox" name="gstInclusive" defaultChecked className="rounded border-input" />
-                Amount includes 10% GST
-              </label>
-            </form>
-          </CardContent>
-        </Card>
+      {/* Invoices */}
+      <Section title="Invoices" flush action={<Link href={`/invoices/new?jobId=${id}`}>New invoice</Link>}>
+        {job.invoices.length === 0 ? (
+          <p className="p-4 text-label-2">Not invoiced yet.</p>
+        ) : (
+          job.invoices.map((i) => (
+            <Row
+              key={i.id}
+              href={`/invoices/${i.id}`}
+              title={i.number}
+              subtitle={`Issued ${formatDate(i.issueDate)}${i.dueDate && i.status === "sent" ? ` · due ${formatDate(i.dueDate)}` : ""}`}
+              detail={formatCents(toCents(i.total))}
+              trailing={<Pill tone={INVOICE_STATUS_TONES[i.status]}>{INVOICE_STATUS_LABELS[i.status]}</Pill>}
+            />
+          ))
+        )}
+      </Section>
 
-        {/* Mileage */}
-        <Card>
-          <CardHeader>
-            <CardTitle className="text-sm font-medium">
-              Mileage <span className="text-xs font-normal text-gray-400">(${DEFAULT_MILEAGE_RATE.toFixed(2)}/km)</span>
-            </CardTitle>
-          </CardHeader>
-          <CardContent className="space-y-4">
-            {job.mileageLogs.length > 0 ? (
-              <table className="w-full text-sm">
-                <thead className="text-left text-gray-500 border-b">
-                  <tr>
-                    <th className="py-2 font-medium">Distance</th>
-                    <th className="py-2 font-medium">Notes</th>
-                    <th className="py-2 font-medium text-right">Total</th>
-                    <th className="py-2 w-8"></th>
-                  </tr>
-                </thead>
-                <tbody className="divide-y">
-                  {job.mileageLogs.map((log) => (
-                    <tr key={log.id}>
-                      <td className="py-2">{Number(log.km)} km</td>
-                      <td className="py-2 text-gray-600">{log.notes ?? "—"}</td>
-                      <td className="py-2 text-right">{formatMoney(log.total)}</td>
-                      <td className="py-2 text-right">
-                        <form
-                          action={async () => {
-                            "use server";
-                            await deleteMileage(job.id, log.id);
-                          }}
-                        >
-                          <button type="submit" className="text-gray-400 hover:text-red-600" aria-label="Delete mileage log">
-                            <Trash2 className="h-4 w-4" />
-                          </button>
-                        </form>
-                      </td>
-                    </tr>
-                  ))}
-                </tbody>
-              </table>
-            ) : (
-              <p className="text-sm text-gray-400">No mileage logged yet.</p>
-            )}
+      {/* Photos */}
+      <Section title="Photos">
+        <JobPhotos jobId={job.id} photos={job.photos.map((p) => ({ id: p.id, imageUrl: p.imageUrl, type: p.type, createdAt: p.createdAt.toISOString() }))} />
+      </Section>
 
-            <form
-              action={async (formData: FormData) => {
-                "use server";
-                await addMileage(job.id, formData);
-              }}
-              className="grid grid-cols-1 sm:grid-cols-[120px_1fr_auto] gap-2 items-end border-t pt-4"
-            >
-              <div className="space-y-1">
-                <Label htmlFor="km">Distance (km)</Label>
-                <Input id="km" name="km" type="number" step="0.01" min="0" required placeholder="0" />
-              </div>
-              <div className="space-y-1">
-                <Label htmlFor="notes">Notes</Label>
-                <Input id="notes" name="notes" placeholder="e.g. depot → site return" />
-              </div>
-              <Button type="submit" size="sm">Add</Button>
-            </form>
-          </CardContent>
-        </Card>
-      </div>
-    </div>
-  );
-}
-
-function Field({
-  label,
-  value,
-  valueClass,
-}: {
-  label: string;
-  value: string;
-  valueClass?: string;
-}) {
-  return (
-    <div>
-      <p className="text-xs text-gray-500">{label}</p>
-      <p className={`font-medium text-gray-900 ${valueClass ?? ""}`}>{value}</p>
-    </div>
+      {/* Details */}
+      <Section title="Details">
+        <dl className="grid grid-cols-2 gap-4 sm:grid-cols-3">
+          <KeyValue label="Start" value={formatDate(job.startDate)} />
+          <KeyValue label="Finish" value={formatDate(job.endDate)} />
+          <KeyValue label="Completed" value={formatDate(job.completedAt)} />
+        </dl>
+        {job.siteAddress && (
+          <a
+            href={`https://maps.apple.com/?q=${encodeURIComponent(job.siteAddress)}`}
+            target="_blank"
+            rel="noreferrer"
+            className="mt-4 inline-flex items-center gap-1.5 font-medium text-tint-ink"
+          >
+            <MapPin className="h-4 w-4" /> {job.siteAddress}
+          </a>
+        )}
+        {job.description && <p className="mt-4 whitespace-pre-wrap text-label-2">{job.description}</p>}
+        {job.quotes.length > 0 && (
+          <p className="footnote mt-4 text-label-2">
+            From quote{" "}
+            {job.quotes.map((q) => (
+              <Link key={q.id} href={`/quotes/${q.id}`} className="font-medium text-tint-ink">
+                {q.number ?? q.title}
+              </Link>
+            ))}
+          </p>
+        )}
+      </Section>
+    </Page>
   );
 }

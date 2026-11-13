@@ -1,302 +1,314 @@
 "use server";
 
 import { z } from "zod";
-import { and, desc, eq } from "drizzle-orm";
+import { and, eq, inArray } from "drizzle-orm";
 import { revalidatePath } from "next/cache";
 import { redirect } from "next/navigation";
 import { db } from "@/db";
-import { jobs, costLines, mileageLogs } from "@/db/schema";
-import { requireOrg } from "@/lib/auth";
-import { DEFAULT_TAX_RATE, DEFAULT_MILEAGE_RATE } from "@/lib/constants";
+import { costLines, files, invoices, jobPhotos, jobs, mileageLogs, receipts } from "@/db/schema";
+import { getOrg, requireOrg } from "@/lib/auth";
+import {
+  checkbox,
+  formObject,
+  invalid,
+  optionalDate,
+  optionalMoney,
+  optionalNumber,
+  optionalText,
+  optionalUuid,
+  requiredMoney,
+  requiredText,
+  type FormState,
+} from "@/lib/actions";
+import { COST_TYPES, JOB_STATUSES } from "@/lib/constants";
+import { gstFromInclusive } from "@/lib/gst";
+import { fromCents } from "@/lib/money";
+import { addDays, addMonths } from "@/lib/periods";
+import { recomputeJobTotals } from "@/lib/data/jobs";
+import { createInvoice, lineItemsForJob } from "@/lib/data/invoices";
+import { ownsClient } from "@/lib/data/ownership";
 
-// Empty form fields arrive as "" — normalise to undefined so optional() applies.
-const emptyToUndefined = (v: unknown) => (v === "" ? undefined : v);
-
-const jobStatuses = [
-  "quoted",
-  "in_progress",
-  "completed",
-  "invoiced",
-  "paid",
-] as const;
-
-const createJobSchema = z.object({
-  name: z.string().trim().min(1, "Job name is required"),
-  clientId: z.preprocess(emptyToUndefined, z.string().uuid().optional()),
-  category: z.preprocess(emptyToUndefined, z.string().trim().optional()),
-  description: z.preprocess(emptyToUndefined, z.string().trim().optional()),
-  quotedPrice: z.preprocess(
-    emptyToUndefined,
-    z
-      .string()
-      .regex(/^\d+(\.\d{1,2})?$/, "Enter a valid amount")
-      .optional()
-  ),
-  startDate: z.preprocess(emptyToUndefined, z.string().optional()),
-  endDate: z.preprocess(emptyToUndefined, z.string().optional()),
+const jobSchema = z.object({
+  name: requiredText("Give the job a name"),
+  clientId: optionalUuid,
+  category: optionalText,
+  siteAddress: optionalText,
+  description: optionalText,
+  quotedPrice: optionalMoney,
+  estimatedCost: optionalMoney,
+  startDate: optionalDate,
+  endDate: optionalDate,
+  hoursWorked: optionalNumber,
+  isRecurring: checkbox,
+  recurrenceInterval: z.preprocess((v) => (v === "" ? undefined : v), z.enum(["weekly", "fortnightly", "monthly"]).optional()),
 });
 
-export type CreateJobState = {
-  errors?: Record<string, string[]>;
-  message?: string;
-};
-
-/**
- * Lists every job for the current org, newest first, with its client joined in.
- * Scoped by `requireOrg()` so a tenant only ever sees its own rows.
- */
-export async function listJobs() {
-  const { orgId } = await requireOrg();
-  return db.query.jobs.findMany({
-    where: eq(jobs.orgId, orgId),
-    orderBy: desc(jobs.createdAt),
-    with: { client: { columns: { name: true } } },
-  });
+async function ownedJob(orgId: string, jobId: string) {
+  return db.query.jobs.findFirst({ where: and(eq(jobs.id, jobId), eq(jobs.orgId, orgId)) });
 }
 
-/**
- * Creates a job from the new-job form. Returns `{ errors }` for `useActionState`
- * when validation fails; on success it revalidates the list and redirects there
- * (redirect throws, so it sits outside any try/catch).
- */
-export async function createJob(
-  _prevState: CreateJobState,
-  formData: FormData
-): Promise<CreateJobState> {
+export async function saveJob(_prev: FormState, formData: FormData): Promise<FormState> {
   const { orgId } = await requireOrg();
-
-  const parsed = createJobSchema.safeParse({
-    name: formData.get("name"),
-    clientId: formData.get("clientId"),
-    category: formData.get("category"),
-    description: formData.get("description"),
-    quotedPrice: formData.get("quotedPrice"),
-    startDate: formData.get("startDate"),
-    endDate: formData.get("endDate"),
-  });
-
-  if (!parsed.success) {
-    return { errors: z.flattenError(parsed.error).fieldErrors };
+  const parsed = jobSchema.safeParse(formObject(formData));
+  if (!parsed.success) return invalid(parsed.error);
+  const d = parsed.data;
+  if (d.startDate && d.endDate && d.endDate < d.startDate) {
+    return { ok: false, message: "Check the dates.", errors: { endDate: ["Finishes before it starts"] } };
+  }
+  if (!(await ownsClient(orgId, d.clientId))) {
+    return { ok: false, message: "Client not found", errors: { clientId: ["Pick a client from the list"] } };
+  }
+  if (d.isRecurring && !d.recurrenceInterval) {
+    return { ok: false, message: "Choose how often it repeats.", errors: { recurrenceInterval: ["Pick an interval"] } };
   }
 
-  const data = parsed.data;
+  const values = {
+    name: d.name,
+    clientId: d.clientId ?? null,
+    category: d.category ?? null,
+    siteAddress: d.siteAddress ?? null,
+    description: d.description ?? null,
+    quotedPrice: d.quotedPrice == null ? null : fromCents(d.quotedPrice),
+    estimatedCost: d.estimatedCost == null ? null : fromCents(d.estimatedCost),
+    startDate: d.startDate ?? null,
+    endDate: d.endDate ?? null,
+    hoursWorked: d.hoursWorked == null ? null : String(d.hoursWorked),
+    isRecurring: d.isRecurring,
+    recurrenceInterval: d.isRecurring ? d.recurrenceInterval ?? null : null,
+    updatedAt: new Date(),
+  };
 
-  await db.insert(jobs).values({
-    orgId,
-    name: data.name,
-    clientId: data.clientId ?? null,
-    category: data.category ?? null,
-    description: data.description ?? null,
-    quotedPrice: data.quotedPrice ?? null,
-    startDate: data.startDate ? new Date(data.startDate) : null,
-    endDate: data.endDate ? new Date(data.endDate) : null,
-  });
+  const id = formData.get("id");
+  let jobId: string;
+  if (typeof id === "string" && id) {
+    const [row] = await db.update(jobs).set(values).where(and(eq(jobs.id, id), eq(jobs.orgId, orgId))).returning({ id: jobs.id });
+    if (!row) return { ok: false, message: "Job not found" };
+    jobId = row.id;
+  } else {
+    const [row] = await db.insert(jobs).values({ ...values, orgId }).returning({ id: jobs.id });
+    jobId = row.id;
+  }
+  await recomputeJobTotals(jobId);
+  revalidatePath("/jobs");
+  redirect(`/jobs/${jobId}`);
+}
 
+export async function deleteJob(formData: FormData) {
+  const { orgId } = await requireOrg();
+  const id = String(formData.get("id") ?? "");
+  if (!(await ownedJob(orgId, id))) return;
+  // Photos' stored files aren't reached by the job's cascade; remove them first.
+  const photoFiles = await db.select({ fileId: jobPhotos.fileId }).from(jobPhotos).where(eq(jobPhotos.jobId, id));
+  const ids = photoFiles.map((p) => p.fileId).filter((x): x is string => !!x);
+  if (ids.length) await db.delete(files).where(and(inArray(files.id, ids), eq(files.orgId, orgId)));
+  await db.delete(jobs).where(and(eq(jobs.id, id), eq(jobs.orgId, orgId)));
   revalidatePath("/jobs");
   redirect("/jobs");
 }
 
+function nextOccurrence(from: Date, interval: string) {
+  if (interval === "weekly") return addDays(from, 7);
+  if (interval === "fortnightly") return addDays(from, 14);
+  return addMonths(from, 1);
+}
+
 /**
- * Fetches one job (scoped to the org) with its client, cost lines and mileage
- * logs joined in. Returns `null` if the id doesn't belong to this org.
+ * Moves a job along quoted → in progress → completed → invoiced → paid.
+ * - completed: stamps completedAt; a recurring job books its next visit.
+ * - invoiced: raises an invoice if the job doesn't have one.
+ * - paid: marks the job's open invoices paid (or creates a paid one).
  */
-export async function getJob(jobId: string) {
-  const { orgId } = await requireOrg();
-  const job = await db.query.jobs.findFirst({
-    where: and(eq(jobs.id, jobId), eq(jobs.orgId, orgId)),
-    with: {
-      client: { columns: { id: true, name: true } },
-      costLines: { orderBy: desc(costLines.createdAt) },
-      mileageLogs: { orderBy: desc(mileageLogs.createdAt) },
-    },
+export async function updateJobStatus(formData: FormData) {
+  const org = await getOrg();
+  const parsed = z
+    .object({ jobId: z.string().uuid(), status: z.enum(JOB_STATUSES) })
+    .safeParse({ jobId: formData.get("jobId"), status: formData.get("status") });
+  if (!parsed.success) return;
+  const { jobId, status } = parsed.data;
+  const job = await ownedJob(org.id, jobId);
+  if (!job) return;
+
+  await db.transaction(async (tx) => {
+    const now = new Date();
+    await tx
+      .update(jobs)
+      .set({ status, updatedAt: now, completedAt: status === "completed" ? job.completedAt ?? now : job.completedAt })
+      .where(eq(jobs.id, jobId));
+
+    const jobInvoices = await tx.select().from(invoices).where(and(eq(invoices.jobId, jobId), inArray(invoices.status, ["draft", "sent", "paid"])));
+
+    if (status === "invoiced") {
+      if (jobInvoices.length === 0) {
+        await createInvoice(tx, org, {
+          jobId,
+          clientId: job.clientId,
+          lineItems: await lineItemsForJob(tx, job, org.gstRegistered),
+          status: "sent",
+        });
+      } else {
+        await tx.update(invoices).set({ status: "sent", sentAt: now, updatedAt: now }).where(and(eq(invoices.jobId, jobId), eq(invoices.status, "draft")));
+      }
+    }
+
+    if (status === "paid") {
+      const open = jobInvoices.filter((i) => i.status !== "paid");
+      if (jobInvoices.length === 0) {
+        await createInvoice(tx, org, {
+          jobId,
+          clientId: job.clientId,
+          lineItems: await lineItemsForJob(tx, job, org.gstRegistered),
+          status: "paid",
+          paidAt: now,
+        });
+      }
+      for (const inv of open) {
+        await tx
+          .update(invoices)
+          .set({ status: "paid", paidAt: now, amountPaid: inv.total, sentAt: inv.sentAt ?? now, updatedAt: now })
+          .where(eq(invoices.id, inv.id));
+      }
+    }
+
+    // Recurring: completing a visit books the next one (once).
+    if (status === "completed" && job.isRecurring && job.recurrenceInterval) {
+      const existing = await tx.query.jobs.findFirst({ where: eq(jobs.parentJobId, job.id) });
+      if (!existing) {
+        const base = job.startDate ?? now;
+        const next = nextOccurrence(base, job.recurrenceInterval);
+        await tx.insert(jobs).values({
+          orgId: org.id,
+          clientId: job.clientId,
+          name: job.name,
+          description: job.description,
+          category: job.category,
+          siteAddress: job.siteAddress,
+          quotedPrice: job.quotedPrice,
+          estimatedCost: job.estimatedCost,
+          status: "quoted",
+          startDate: next,
+          isRecurring: true,
+          recurrenceInterval: job.recurrenceInterval,
+          parentJobId: job.id,
+        });
+      }
+    }
   });
-  return job ?? null;
-}
 
-/**
- * Recomputes and persists a job's `actualCost` (sum of cost lines + mileage
- * totals) and `profit` (quotedPrice − actualCost). Called after any cost/mileage
- * mutation so the job row stays the single source of truth for reporting.
- */
-async function recomputeJobTotals(jobId: string) {
-  const [lines, miles, job] = await Promise.all([
-    db.query.costLines.findMany({ where: eq(costLines.jobId, jobId) }),
-    db.query.mileageLogs.findMany({ where: eq(mileageLogs.jobId, jobId) }),
-    db.query.jobs.findFirst({ where: eq(jobs.id, jobId) }),
-  ]);
-
-  const costTotal =
-    lines.reduce((sum, l) => sum + Number(l.amount), 0) +
-    miles.reduce((sum, m) => sum + Number(m.total), 0);
-
-  const quoted = job?.quotedPrice != null ? Number(job.quotedPrice) : null;
-
-  await db
-    .update(jobs)
-    .set({
-      actualCost: costTotal.toFixed(2),
-      profit: quoted != null ? (quoted - costTotal).toFixed(2) : null,
-      updatedAt: new Date(),
-    })
-    .where(eq(jobs.id, jobId));
-}
-
-/**
- * Moves a single job along the status pipeline
- * (quoted → in_progress → completed → invoiced → paid). The `orgId` is included
- * in the WHERE so one tenant can never mutate another's job.
- */
-export async function updateJobStatus(jobId: string, status: string) {
-  const { orgId } = await requireOrg();
-
-  const parsed = z.object({
-    jobId: z.string().uuid(),
-    status: z.enum(jobStatuses),
-  }).safeParse({ jobId, status });
-
-  if (!parsed.success) {
-    return { error: "Invalid job or status" };
-  }
-
-  await db
-    .update(jobs)
-    .set({ status: parsed.data.status, updatedAt: new Date() })
-    .where(and(eq(jobs.id, parsed.data.jobId), eq(jobs.orgId, orgId)));
-
+  await recomputeJobTotals(jobId);
   revalidatePath("/jobs");
-  revalidatePath(`/jobs/${parsed.data.jobId}`);
-  return { ok: true };
+  revalidatePath(`/jobs/${jobId}`);
+  revalidatePath("/invoices");
+  revalidatePath("/");
 }
-
-const costTypes = ["materials", "labour", "travel", "other"] as const;
 
 const costLineSchema = z.object({
-  jobId: z.string().uuid(),
-  type: z.enum(costTypes),
-  description: z.preprocess(emptyToUndefined, z.string().trim().optional()),
-  amount: z.string().regex(/^\d+(\.\d{1,2})?$/, "Enter a valid amount"),
-  gstInclusive: z.preprocess((v) => v === "on" || v === "true", z.boolean()),
+  type: z.enum(COST_TYPES),
+  description: optionalText,
+  amount: requiredMoney,
+  gstInclusive: checkbox,
 });
 
-/**
- * Adds a cost line to a job. If `gstInclusive` is set, the GST component is
- * extracted from the amount (amount − amount/(1+rate)); otherwise GST is 0.
- * Verifies the job belongs to the org before writing, then recomputes totals.
- */
-export async function addCostLine(jobId: string, formData: FormData) {
-  const { orgId } = await requireOrg();
-
-  const parsed = costLineSchema.safeParse({
-    jobId,
-    type: formData.get("type"),
-    description: formData.get("description"),
-    amount: formData.get("amount"),
-    gstInclusive: formData.get("gstInclusive"),
-  });
-  if (!parsed.success) {
-    return { error: z.flattenError(parsed.error).fieldErrors };
-  }
-
-  const owns = await db.query.jobs.findFirst({
-    where: and(eq(jobs.id, jobId), eq(jobs.orgId, orgId)),
-    columns: { id: true },
-  });
-  if (!owns) return { error: { jobId: ["Job not found"] } };
-
-  const amount = Number(parsed.data.amount);
-  const gstAmount = parsed.data.gstInclusive
-    ? amount - amount / (1 + DEFAULT_TAX_RATE)
-    : 0;
-
+export async function addCostLine(_prev: FormState, formData: FormData): Promise<FormState> {
+  const org = await getOrg();
+  const jobId = String(formData.get("jobId") ?? "");
+  if (!(await ownedJob(org.id, jobId))) return { ok: false, message: "Job not found" };
+  const parsed = costLineSchema.safeParse(formObject(formData));
+  if (!parsed.success) return invalid(parsed.error);
+  const amount = parsed.data.amount;
+  // Labour paid to yourself or wages carry no GST; supplier costs usually do.
+  const gst = parsed.data.gstInclusive && org.gstRegistered ? gstFromInclusive(amount) : 0;
   await db.insert(costLines).values({
     jobId,
     type: parsed.data.type,
     description: parsed.data.description ?? null,
-    amount: amount.toFixed(2),
-    gstAmount: gstAmount.toFixed(2),
+    amount: fromCents(amount),
+    gstAmount: fromCents(gst),
   });
-
   await recomputeJobTotals(jobId);
   revalidatePath(`/jobs/${jobId}`);
-  return { ok: true };
+  return { ok: true, message: "Cost added" };
 }
 
-/** Deletes a cost line (verifying org ownership via its parent job), recomputes totals. */
-export async function deleteCostLine(jobId: string, costLineId: string) {
+export async function deleteCostLine(formData: FormData) {
   const { orgId } = await requireOrg();
-  const owns = await db.query.jobs.findFirst({
-    where: and(eq(jobs.id, jobId), eq(jobs.orgId, orgId)),
-    columns: { id: true },
-  });
-  if (!owns) return { error: "Job not found" };
-
-  await db
-    .delete(costLines)
-    .where(and(eq(costLines.id, costLineId), eq(costLines.jobId, jobId)));
-
+  const jobId = String(formData.get("jobId") ?? "");
+  if (!(await ownedJob(orgId, jobId))) return;
+  await db.delete(costLines).where(and(eq(costLines.id, String(formData.get("id"))), eq(costLines.jobId, jobId)));
   await recomputeJobTotals(jobId);
   revalidatePath(`/jobs/${jobId}`);
-  return { ok: true };
 }
 
-const mileageSchema = z.object({
-  jobId: z.string().uuid(),
-  km: z.string().regex(/^\d+(\.\d{1,2})?$/, "Enter valid km"),
-  notes: z.preprocess(emptyToUndefined, z.string().trim().optional()),
-});
-
-/**
- * Logs mileage for a job at the ATO per-km rate (constants), auto-computing the
- * total. Verifies org ownership, then recomputes job totals.
- */
-export async function addMileage(jobId: string, formData: FormData) {
-  const { orgId } = await requireOrg();
-
-  const parsed = mileageSchema.safeParse({
-    jobId,
-    km: formData.get("km"),
-    notes: formData.get("notes"),
-  });
-  if (!parsed.success) {
-    return { error: z.flattenError(parsed.error).fieldErrors };
-  }
-
-  const owns = await db.query.jobs.findFirst({
-    where: and(eq(jobs.id, jobId), eq(jobs.orgId, orgId)),
-    columns: { id: true },
-  });
-  if (!owns) return { error: { jobId: ["Job not found"] } };
-
-  const km = Number(parsed.data.km);
-  const total = km * DEFAULT_MILEAGE_RATE;
-
+export async function addMileage(_prev: FormState, formData: FormData): Promise<FormState> {
+  const org = await getOrg();
+  const jobId = String(formData.get("jobId") ?? "");
+  if (!(await ownedJob(org.id, jobId))) return { ok: false, message: "Job not found" };
+  const parsed = z
+    .object({ km: z.coerce.number({ error: "Enter the distance" }).positive("Enter the distance").max(10000), notes: optionalText })
+    .safeParse(formObject(formData));
+  if (!parsed.success) return invalid(parsed.error);
+  const rate = Number(org.mileageRate);
+  const total = Math.round(parsed.data.km * rate * 100);
   await db.insert(mileageLogs).values({
     jobId,
-    km: km.toFixed(2),
-    ratePerKm: DEFAULT_MILEAGE_RATE.toFixed(4),
-    total: total.toFixed(2),
+    km: parsed.data.km.toFixed(2),
+    ratePerKm: rate.toFixed(4),
+    total: fromCents(total),
     notes: parsed.data.notes ?? null,
   });
-
   await recomputeJobTotals(jobId);
   revalidatePath(`/jobs/${jobId}`);
-  return { ok: true };
+  return { ok: true, message: "Trip logged" };
 }
 
-/** Deletes a mileage log (verifying org ownership via its parent job), recomputes totals. */
-export async function deleteMileage(jobId: string, mileageId: string) {
+export async function deleteMileage(formData: FormData) {
   const { orgId } = await requireOrg();
-  const owns = await db.query.jobs.findFirst({
-    where: and(eq(jobs.id, jobId), eq(jobs.orgId, orgId)),
-    columns: { id: true },
-  });
-  if (!owns) return { error: "Job not found" };
-
-  await db
-    .delete(mileageLogs)
-    .where(and(eq(mileageLogs.id, mileageId), eq(mileageLogs.jobId, jobId)));
-
+  const jobId = String(formData.get("jobId") ?? "");
+  if (!(await ownedJob(orgId, jobId))) return;
+  await db.delete(mileageLogs).where(and(eq(mileageLogs.id, String(formData.get("id"))), eq(mileageLogs.jobId, jobId)));
   await recomputeJobTotals(jobId);
   revalidatePath(`/jobs/${jobId}`);
-  return { ok: true };
+}
+
+export async function logHours(_prev: FormState, formData: FormData): Promise<FormState> {
+  const { orgId } = await requireOrg();
+  const jobId = String(formData.get("jobId") ?? "");
+  const job = await ownedJob(orgId, jobId);
+  if (!job) return { ok: false, message: "Job not found" };
+  const parsed = z.object({ hours: z.coerce.number({ error: "Enter hours" }).positive("Enter hours").max(1000) }).safeParse(formObject(formData));
+  if (!parsed.success) return invalid(parsed.error);
+  const total = Number(job.hoursWorked ?? 0) + parsed.data.hours;
+  await db.update(jobs).set({ hoursWorked: total.toFixed(2), updatedAt: new Date() }).where(eq(jobs.id, jobId));
+  revalidatePath(`/jobs/${jobId}`);
+  return { ok: true, message: `${parsed.data.hours} h added` };
+}
+
+export async function linkReceipt(formData: FormData) {
+  const { orgId } = await requireOrg();
+  const jobId = String(formData.get("jobId") ?? "");
+  const receiptId = String(formData.get("receiptId") ?? "");
+  if (!receiptId || !(await ownedJob(orgId, jobId))) return;
+  await db.update(receipts).set({ jobId, updatedAt: new Date() }).where(and(eq(receipts.id, receiptId), eq(receipts.orgId, orgId)));
+  await recomputeJobTotals(jobId);
+  revalidatePath(`/jobs/${jobId}`);
+}
+
+export async function unlinkReceipt(formData: FormData) {
+  const { orgId } = await requireOrg();
+  const jobId = String(formData.get("jobId") ?? "");
+  const receiptId = String(formData.get("receiptId") ?? "");
+  await db.update(receipts).set({ jobId: null, updatedAt: new Date() }).where(and(eq(receipts.id, receiptId), eq(receipts.orgId, orgId), eq(receipts.jobId, jobId)));
+  await recomputeJobTotals(jobId);
+  revalidatePath(`/jobs/${jobId}`);
+}
+
+export async function deletePhoto(formData: FormData) {
+  const { orgId } = await requireOrg();
+  const jobId = String(formData.get("jobId") ?? "");
+  if (!(await ownedJob(orgId, jobId))) return;
+  const photo = await db.query.jobPhotos.findFirst({ where: and(eq(jobPhotos.id, String(formData.get("id") ?? "")), eq(jobPhotos.jobId, jobId)) });
+  if (!photo) return;
+  // Deleting the file cascades to the photo row.
+  if (photo.fileId) await db.delete(files).where(and(eq(files.id, photo.fileId), eq(files.orgId, orgId)));
+  else await db.delete(jobPhotos).where(eq(jobPhotos.id, photo.id));
+  revalidatePath(`/jobs/${jobId}`);
 }

@@ -1,119 +1,77 @@
-import { Header } from "@/components/layout/Header";
-import { Button } from "@/components/ui/button";
-import { Badge } from "@/components/ui/badge";
-import { QUOTE_STATUS_LABELS, QUOTE_STATUS_COLORS } from "@/lib/constants";
-import { formatMoney, formatDate } from "@/lib/format";
-import { listQuotes, updateQuoteStatus, convertQuoteToJob } from "./actions";
-import Link from "next/link";
-import { Plus } from "lucide-react";
+import { and, desc, eq, type SQL } from "drizzle-orm";
+import { FileText } from "lucide-react";
+import { db } from "@/db";
+import { clients, quotes } from "@/db/schema";
+import { getOrg } from "@/lib/auth";
+import { QUOTE_STATUS_LABELS, QUOTE_STATUS_TONES, QUOTE_STATUSES } from "@/lib/constants";
+import { formatCents, formatDate, formatPercent } from "@/lib/format";
+import { toCents } from "@/lib/money";
+import { daysBetween } from "@/lib/periods";
+import { EmptyState, LinkButton, Page, PageHeader, Pill, Row, Section, Segmented, StatTile } from "@/components/kit/ui";
 
-export default async function QuotesPage() {
-  const quotes = await listQuotes();
+export const metadata = { title: "Quotes" };
+
+export default async function QuotesPage({ searchParams }: { searchParams: Promise<{ status?: string }> }) {
+  const org = await getOrg();
+  const sp = await searchParams;
+  const status = (QUOTE_STATUSES as readonly string[]).includes(sp.status ?? "") ? sp.status! : "all";
+
+  const conds: SQL[] = [eq(quotes.orgId, org.id)];
+  if (status !== "all") conds.push(eq(quotes.status, status as (typeof QUOTE_STATUSES)[number]));
+  const [rows, all] = await Promise.all([
+    db
+      .select({ quote: quotes, clientName: clients.name })
+      .from(quotes)
+      .leftJoin(clients, eq(clients.id, quotes.clientId))
+      .where(and(...conds))
+      .orderBy(desc(quotes.createdAt))
+      .limit(300),
+    db.select({ status: quotes.status, total: quotes.total, sentAt: quotes.sentAt }).from(quotes).where(eq(quotes.orgId, org.id)),
+  ]);
+
+  const decided = all.filter((q) => ["accepted", "declined", "no_response"].includes(q.status));
+  const winRate = decided.length ? (decided.filter((q) => q.status === "accepted").length / decided.length) * 100 : null;
+  const open = all.filter((q) => q.status === "sent");
+  const now = new Date();
+  const stale = open.filter((q) => q.sentAt && daysBetween(q.sentAt, now) >= 7).length;
 
   return (
-    <div>
-      <Header
-        title="Quotes"
-        action={
-          <Button size="sm" render={<Link href="/quotes/new" />}>
-            <Plus className="h-4 w-4 mr-1" />
-            New Quote
-          </Button>
-        }
-      />
-      <div className="p-6">
-        {quotes.length === 0 ? (
-          <div className="text-center py-16 text-gray-400">
-            <p className="text-sm">No quotes yet.</p>
-            <Button size="sm" className="mt-4" render={<Link href="/quotes/new" />}>
-              Create your first quote
-            </Button>
-          </div>
-        ) : (
-          <div className="bg-white rounded-lg border overflow-hidden">
-            <table className="w-full text-sm">
-              <thead className="bg-gray-50 border-b">
-                <tr>
-                  <th className="text-left px-4 py-3 font-medium text-gray-600">Quote</th>
-                  <th className="text-left px-4 py-3 font-medium text-gray-600">Client</th>
-                  <th className="text-left px-4 py-3 font-medium text-gray-600">Status</th>
-                  <th className="text-left px-4 py-3 font-medium text-gray-600">Valid Until</th>
-                  <th className="text-right px-4 py-3 font-medium text-gray-600">Total</th>
-                  <th className="text-right px-4 py-3 font-medium text-gray-600">Actions</th>
-                </tr>
-              </thead>
-              <tbody className="divide-y">
-                {quotes.map((quote) => (
-                  <tr key={quote.id} className="hover:bg-gray-50">
-                    <td className="px-4 py-3 font-medium text-gray-900">{quote.title}</td>
-                    <td className="px-4 py-3 text-gray-600">{quote.client?.name ?? "—"}</td>
-                    <td className="px-4 py-3">
-                      <Badge className={QUOTE_STATUS_COLORS[quote.status]}>
-                        {QUOTE_STATUS_LABELS[quote.status]}
-                      </Badge>
-                    </td>
-                    <td className="px-4 py-3 text-gray-600">{formatDate(quote.validUntil)}</td>
-                    <td className="px-4 py-3 text-right text-gray-900">{formatMoney(quote.total)}</td>
-                    <td className="px-4 py-3">
-                      <div className="flex justify-end gap-2">
-                        {quote.status === "draft" && (
-                          <StatusButton quoteId={quote.id} status="sent" label="Mark Sent" />
-                        )}
-                        {quote.status === "sent" && (
-                          <>
-                            <StatusButton quoteId={quote.id} status="accepted" label="Accepted" />
-                            <StatusButton quoteId={quote.id} status="declined" label="Declined" variant="outline" />
-                          </>
-                        )}
-                        {quote.status === "accepted" && !quote.jobId && (
-                          <form
-                            action={async () => {
-                              "use server";
-                              await convertQuoteToJob(quote.id);
-                            }}
-                          >
-                            <Button type="submit" size="sm">Convert to Job</Button>
-                          </form>
-                        )}
-                        {quote.jobId && (
-                          <Button size="sm" variant="outline" render={<Link href={`/jobs/${quote.jobId}`} />}>
-                            View Job
-                          </Button>
-                        )}
-                      </div>
-                    </td>
-                  </tr>
-                ))}
-              </tbody>
-            </table>
-          </div>
-        )}
+    <Page>
+      <PageHeader title="Quotes" actions={<LinkButton href="/quotes/new">New quote</LinkButton>} />
+      <div className="mb-6 grid grid-cols-3 gap-3">
+        <StatTile label="Win rate" value={formatPercent(winRate)} hint={`${decided.length} decided`} />
+        <StatTile label="Awaiting reply" value={String(open.length)} hint={formatCents(open.reduce((s, q) => s + toCents(q.total), 0))} />
+        <StatTile label="Follow up" value={String(stale)} tone={stale ? "warn" : undefined} hint="Sent 7+ days ago" />
       </div>
-    </div>
-  );
-}
-
-function StatusButton({
-  quoteId,
-  status,
-  label,
-  variant = "default",
-}: {
-  quoteId: string;
-  status: string;
-  label: string;
-  variant?: "default" | "outline";
-}) {
-  return (
-    <form
-      action={async () => {
-        "use server";
-        await updateQuoteStatus(quoteId, status);
-      }}
-    >
-      <Button type="submit" size="sm" variant={variant}>
-        {label}
-      </Button>
-    </form>
+      <Segmented
+        className="mb-4"
+        label="Filter quotes"
+        value={status}
+        options={[{ value: "all", label: "All", href: "/quotes" }, ...QUOTE_STATUSES.map((s) => ({ value: s, label: QUOTE_STATUS_LABELS[s], href: `/quotes?status=${s}` }))]}
+      />
+      {rows.length === 0 ? (
+        <Section>
+          <EmptyState
+            icon={<FileText />}
+            title="No quotes here"
+            body="Quotes track your win rate and turn into jobs in one tap once accepted."
+            action={<LinkButton href="/quotes/new">New quote</LinkButton>}
+          />
+        </Section>
+      ) : (
+        <Section flush>
+          {rows.map(({ quote: q, clientName }) => (
+            <Row
+              key={q.id}
+              href={`/quotes/${q.id}`}
+              title={q.title}
+              subtitle={[q.number, clientName, formatDate(q.createdAt)].filter(Boolean).join(" · ")}
+              detail={<span className="font-semibold text-label">{formatCents(toCents(q.total))}</span>}
+              trailing={<Pill tone={QUOTE_STATUS_TONES[q.status]}>{QUOTE_STATUS_LABELS[q.status]}</Pill>}
+            />
+          ))}
+        </Section>
+      )}
+    </Page>
   );
 }
